@@ -5,6 +5,9 @@ from typing import Any, override
 import pyvera as veraApi
 
 from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
     ENTITY_ID_FORMAT,
     FAN_AUTO,
     FAN_ON,
@@ -46,12 +49,6 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
 
     _attr_hvac_modes = SUPPORT_HVAC
     _attr_fan_modes = FAN_OPERATION_LIST
-    _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.TURN_OFF
-        | ClimateEntityFeature.TURN_ON
-    )
 
     def __init__(
         self, vera_device: veraApi.VeraThermostat, controller_data: ControllerData
@@ -59,6 +56,42 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
         """Initialize the Vera device."""
         VeraEntity.__init__(self, vera_device, controller_data)
         self.entity_id = ENTITY_ID_FORMAT.format(self.vera_id)
+
+    @override
+    def update(self) -> None:
+        """Refresh the device, including its heat and cool setpoints.
+
+        The heat and cool setpoint variables are not part of the Vera's
+        summary data, so they are refreshed on every update.
+        """
+        super().update()
+        self.vera_device.refresh_states()
+
+    @property
+    def _heat_setpoint(self) -> float | None:
+        return self.vera_device.get_heat_setpoint()
+
+    @property
+    def _cool_setpoint(self) -> float | None:
+        return self.vera_device.get_cool_setpoint()
+
+    @property
+    def _has_heat_cool_range(self) -> bool:
+        """Return True when the thermostat reports both heat and cool setpoints."""
+        return self._heat_setpoint is not None and self._cool_setpoint is not None
+
+    @property
+    @override
+    def supported_features(self) -> ClimateEntityFeature:
+        """Return a setpoint range in auto mode when both setpoints exist."""
+        features = (
+            ClimateEntityFeature.FAN_MODE
+            | ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TURN_ON
+        )
+        if self.hvac_mode == HVACMode.HEAT_COOL and self._has_heat_cool_range:
+            return features | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        return features | ClimateEntityFeature.TARGET_TEMPERATURE
 
     @property
     @override
@@ -120,13 +153,44 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
     @override
     def native_target_temperature(self) -> float | None:
         """Return the temperature we try to reach."""
+        mode = self.hvac_mode
+        if mode == HVACMode.HEAT and self._heat_setpoint is not None:
+            return self._heat_setpoint
+        if mode == HVACMode.COOL and self._cool_setpoint is not None:
+            return self._cool_setpoint
         return self.vera_device.get_current_goal_temperature()
+
+    @property
+    @override
+    def native_target_temperature_low(self) -> float | None:
+        """Return the lower bound of the auto range (the heat setpoint)."""
+        return self._heat_setpoint
+
+    @property
+    @override
+    def native_target_temperature_high(self) -> float | None:
+        """Return the upper bound of the auto range (the cool setpoint)."""
+        return self._cool_setpoint
 
     @override
     def set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperatures."""
-        if kwargs.get(ATTR_TEMPERATURE) is not None:
-            self.vera_device.set_temperature(kwargs.get(ATTR_TEMPERATURE))
+        if (hvac_mode := kwargs.get(ATTR_HVAC_MODE)) is not None:
+            self.set_hvac_mode(hvac_mode)
+
+        mode = self.hvac_mode
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is not None:
+            if mode == HVACMode.HEAT and self._heat_setpoint is not None:
+                self.vera_device.set_heat_setpoint(temperature)
+            elif mode == HVACMode.COOL and self._cool_setpoint is not None:
+                self.vera_device.set_cool_setpoint(temperature)
+            else:
+                self.vera_device.set_temperature(temperature)
+
+        if (target_low := kwargs.get(ATTR_TARGET_TEMP_LOW)) is not None:
+            self.vera_device.set_heat_setpoint(target_low)
+        if (target_high := kwargs.get(ATTR_TARGET_TEMP_HIGH)) is not None:
+            self.vera_device.set_cool_setpoint(target_high)
 
         self.schedule_update_ha_state()
 

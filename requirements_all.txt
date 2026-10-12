@@ -2876,7 +2876,7 @@ pytrydan==1.0.5
 pyuptimerobot==25.0.0
 
 # homeassistant.components.vera
-pyvera==0.3.16
+pyvera==0.3.17
 
 # homeassistant.components.versasense
 pyversasense==0.0.6

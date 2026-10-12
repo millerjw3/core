@@ -5,8 +5,15 @@ from unittest.mock import MagicMock
 import pytest
 import pyvera as pv
 
-from homeassistant.components.climate import FAN_AUTO, FAN_ON, HVACAction, HVACMode
+from homeassistant.components.climate import (
+    FAN_AUTO,
+    FAN_ON,
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 
 from .common import ComponentFactory, new_simple_controller_config
 
@@ -25,6 +32,8 @@ async def test_climate(
     vera_device.get_current_temperature.return_value = 71
     vera_device.get_hvac_mode.return_value = "Off"
     vera_device.get_current_goal_temperature.return_value = 72
+    vera_device.get_heat_setpoint.return_value = None
+    vera_device.get_cool_setpoint.return_value = None
     entity_id = "climate.dev1_1"
 
     component_data = await vera_component_factory.configure_component(
@@ -206,3 +215,130 @@ async def test_climate_f(
     await hass.async_block_till_done()
     assert hass.states.get(entity_id).attributes["current_temperature"] == -3.9
     assert hass.states.get(entity_id).attributes["temperature"] == -1.1
+
+
+def _new_heat_cool_thermostat(vera_hvac_mode: str) -> pv.VeraThermostat:
+    """Return a thermostat that reports separate heat and cool setpoints."""
+    vera_device: pv.VeraThermostat = MagicMock(spec=pv.VeraThermostat)
+    vera_device.device_id = 1
+    vera_device.vera_device_id = vera_device.device_id
+    vera_device.comm_failure = False
+    vera_device.name = "dev1"
+    vera_device.category = pv.CATEGORY_THERMOSTAT
+    vera_device.power = 10
+    vera_device.get_current_temperature.return_value = 20
+    vera_device.get_hvac_mode.return_value = vera_hvac_mode
+    # Some Vera firmware reports the midpoint here while in auto mode.
+    vera_device.get_current_goal_temperature.return_value = 21.75
+    vera_device.get_heat_setpoint.return_value = 19.5
+    vera_device.get_cool_setpoint.return_value = 24
+    return vera_device
+
+
+@pytest.mark.parametrize(
+    ("vera_hvac_mode", "expected_target", "setter"),
+    [
+        pytest.param("HeatOn", 19.5, "set_heat_setpoint", id="heat"),
+        pytest.param("CoolOn", 24, "set_cool_setpoint", id="cool"),
+    ],
+)
+async def test_heat_cool_setpoints_single_mode(
+    hass: HomeAssistant,
+    vera_component_factory: ComponentFactory,
+    vera_hvac_mode: str,
+    expected_target: float,
+    setter: str,
+) -> None:
+    """Test heat and cool modes use the matching setpoint."""
+    vera_device = _new_heat_cool_thermostat(vera_hvac_mode)
+    entity_id = "climate.dev1_1"
+
+    await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+    vera_device.refresh_states.assert_called()
+
+    state = hass.states.get(entity_id)
+    assert state.attributes["temperature"] == expected_target
+    assert "target_temp_low" not in state.attributes
+    assert "target_temp_high" not in state.attributes
+
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {"entity_id": entity_id, "temperature": 21},
+        blocking=True,
+    )
+    getattr(vera_device, setter).assert_called_once_with(21)
+    vera_device.set_temperature.assert_not_called()
+
+
+async def test_heat_cool_setpoints_auto_mode(
+    hass: HomeAssistant, vera_component_factory: ComponentFactory
+) -> None:
+    """Test auto mode exposes the heat and cool setpoints as a range."""
+    vera_device = _new_heat_cool_thermostat("AutoChangeOver")
+    entity_id = "climate.dev1_1"
+
+    await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+
+    state = hass.states.get(entity_id)
+    assert state.state == HVACMode.HEAT_COOL
+    assert "temperature" not in state.attributes
+    assert state.attributes["target_temp_low"] == 19.5
+    assert state.attributes["target_temp_high"] == 24
+    features = state.attributes["supported_features"]
+    assert features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+    assert not features & ClimateEntityFeature.TARGET_TEMPERATURE
+
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {"entity_id": entity_id, "target_temp_low": 18, "target_temp_high": 25},
+        blocking=True,
+    )
+    vera_device.set_heat_setpoint.assert_called_once_with(18)
+    vera_device.set_cool_setpoint.assert_called_once_with(25)
+    vera_device.set_temperature.assert_not_called()
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {"entity_id": entity_id, "temperature": 21},
+            blocking=True,
+        )
+    vera_device.set_temperature.assert_not_called()
+
+
+async def test_heat_cool_setpoints_set_temperature_with_hvac_mode(
+    hass: HomeAssistant, vera_component_factory: ComponentFactory
+) -> None:
+    """Test a mode change in set_temperature writes the new mode's setpoint."""
+    vera_device = _new_heat_cool_thermostat("HeatOn")
+    entity_id = "climate.dev1_1"
+
+    def turn_cool_on() -> None:
+        # pyvera caches the requested mode when it is set.
+        vera_device.get_hvac_mode.return_value = "CoolOn"
+
+    vera_device.turn_cool_on.side_effect = turn_cool_on
+
+    await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+
+    await hass.services.async_call(
+        "climate",
+        "set_temperature",
+        {"entity_id": entity_id, "temperature": 23, "hvac_mode": HVACMode.COOL},
+        blocking=True,
+    )
+    vera_device.turn_cool_on.assert_called_once()
+    vera_device.set_cool_setpoint.assert_called_once_with(23)
+    vera_device.set_heat_setpoint.assert_not_called()
