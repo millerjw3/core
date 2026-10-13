@@ -8,6 +8,8 @@ import pyvera as pv
 from homeassistant.components.climate import (
     FAN_AUTO,
     FAN_ON,
+    PRESET_ECO,
+    PRESET_NONE,
     ClimateEntityFeature,
     HVACAction,
     HVACMode,
@@ -23,6 +25,7 @@ async def test_climate(
 ) -> None:
     """Test function."""
     vera_device: pv.VeraThermostat = MagicMock(spec=pv.VeraThermostat)
+    vera_device.get_energy_mode.return_value = None
     vera_device.device_id = 1
     vera_device.vera_device_id = vera_device.device_id
     vera_device.comm_failure = False
@@ -154,6 +157,7 @@ async def test_hvac_action(
 ) -> None:
     """Test HVAC action."""
     vera_device: pv.VeraThermostat = MagicMock(spec=pv.VeraThermostat)
+    vera_device.get_energy_mode.return_value = None
     vera_device.device_id = 1
     vera_device.vera_device_id = vera_device.device_id
     vera_device.comm_failure = False
@@ -180,6 +184,7 @@ async def test_climate_f(
 ) -> None:
     """Test function."""
     vera_device: pv.VeraThermostat = MagicMock(spec=pv.VeraThermostat)
+    vera_device.get_energy_mode.return_value = None
     vera_device.device_id = 1
     vera_device.vera_device_id = vera_device.device_id
     vera_device.comm_failure = False
@@ -220,6 +225,7 @@ async def test_climate_f(
 def _new_heat_cool_thermostat(vera_hvac_mode: str) -> pv.VeraThermostat:
     """Return a thermostat that reports separate heat and cool setpoints."""
     vera_device: pv.VeraThermostat = MagicMock(spec=pv.VeraThermostat)
+    vera_device.get_energy_mode.return_value = None
     vera_device.device_id = 1
     vera_device.vera_device_id = vera_device.device_id
     vera_device.comm_failure = False
@@ -342,3 +348,106 @@ async def test_heat_cool_setpoints_set_temperature_with_hvac_mode(
     vera_device.turn_cool_on.assert_called_once()
     vera_device.set_cool_setpoint.assert_called_once_with(23)
     vera_device.set_heat_setpoint.assert_not_called()
+
+
+async def test_energy_mode_preset(
+    hass: HomeAssistant, vera_component_factory: ComponentFactory
+) -> None:
+    """Test the eco preset follows the thermostat's energy mode."""
+    vera_device = _new_heat_cool_thermostat("HeatOn")
+    vera_device.get_energy_mode.return_value = "Normal"
+    entity_id = "climate.dev1_1"
+
+    component_data = await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+    update_callback = component_data.controller_data[0].update_callback
+
+    state = hass.states.get(entity_id)
+    assert state.attributes["preset_mode"] == PRESET_NONE
+    assert state.attributes["preset_modes"] == [PRESET_NONE, PRESET_ECO]
+    assert state.attributes["supported_features"] & ClimateEntityFeature.PRESET_MODE
+    assert state.attributes["temperature"] == 19.5
+
+    await hass.services.async_call(
+        "climate",
+        "set_preset_mode",
+        {"entity_id": entity_id, "preset_mode": PRESET_ECO},
+        blocking=True,
+    )
+    vera_device.set_energy_mode.assert_called_once_with("EnergySavingsMode")
+
+    # In energy savings mode the Vera reports the economy variant of the mode.
+    vera_device.get_energy_mode.return_value = "EnergySavingsMode"
+    vera_device.get_hvac_mode.return_value = "EconomyHeatOn"
+    update_callback(vera_device)
+    await hass.async_block_till_done()
+    state = hass.states.get(entity_id)
+    assert state.state == HVACMode.HEAT
+    assert state.attributes["preset_mode"] == PRESET_ECO
+    # The setback setpoint is not reported, so no target is exposed.
+    assert "temperature" not in state.attributes
+    assert not state.attributes["supported_features"] & (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+    )
+
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {"entity_id": entity_id, "temperature": 21},
+            blocking=True,
+        )
+    vera_device.set_heat_setpoint.assert_not_called()
+
+    await hass.services.async_call(
+        "climate",
+        "set_preset_mode",
+        {"entity_id": entity_id, "preset_mode": PRESET_NONE},
+        blocking=True,
+    )
+    vera_device.set_energy_mode.assert_called_with("Normal")
+
+
+@pytest.mark.parametrize(
+    ("vera_hvac_mode", "expected_mode"),
+    [
+        pytest.param("EconomyHeatOn", HVACMode.HEAT, id="heat"),
+        pytest.param("EconomyCoolOn", HVACMode.COOL, id="cool"),
+        pytest.param("EconomyAutoChangeOver", HVACMode.HEAT_COOL, id="auto"),
+    ],
+)
+async def test_economy_hvac_modes(
+    hass: HomeAssistant,
+    vera_component_factory: ComponentFactory,
+    vera_hvac_mode: str,
+    expected_mode: HVACMode,
+) -> None:
+    """Test economy variants of the hvac mode map to the base mode."""
+    vera_device = _new_heat_cool_thermostat(vera_hvac_mode)
+    vera_device.get_energy_mode.return_value = "EnergySavingsMode"
+
+    await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+
+    assert hass.states.get("climate.dev1_1").state == expected_mode
+
+
+async def test_no_energy_mode(
+    hass: HomeAssistant, vera_component_factory: ComponentFactory
+) -> None:
+    """Test thermostats without an energy mode do not offer presets."""
+    vera_device = _new_heat_cool_thermostat("HeatOn")
+
+    await vera_component_factory.configure_component(
+        hass=hass,
+        controller_config=new_simple_controller_config(devices=(vera_device,)),
+    )
+
+    state = hass.states.get("climate.dev1_1")
+    assert "preset_mode" not in state.attributes
+    assert not state.attributes["supported_features"] & ClimateEntityFeature.PRESET_MODE

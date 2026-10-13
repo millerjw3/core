@@ -11,6 +11,8 @@ from homeassistant.components.climate import (
     ENTITY_ID_FORMAT,
     FAN_AUTO,
     FAN_ON,
+    PRESET_ECO,
+    PRESET_NONE,
     ClimateEntity,
     ClimateEntityFeature,
     HVACAction,
@@ -26,6 +28,9 @@ from .entity import VeraEntity
 FAN_OPERATION_LIST = [FAN_ON, FAN_AUTO]
 
 SUPPORT_HVAC = [HVACMode.COOL, HVACMode.HEAT, HVACMode.HEAT_COOL, HVACMode.OFF]
+
+ENERGY_MODE_NORMAL = "Normal"
+ENERGY_MODE_SAVINGS = "EnergySavingsMode"
 
 
 async def async_setup_entry(
@@ -49,6 +54,7 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
 
     _attr_hvac_modes = SUPPORT_HVAC
     _attr_fan_modes = FAN_OPERATION_LIST
+    _attr_preset_modes = [PRESET_NONE, PRESET_ECO]
 
     def __init__(
         self, vera_device: veraApi.VeraThermostat, controller_data: ControllerData
@@ -76,6 +82,19 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
         return self.vera_device.get_cool_setpoint()
 
     @property
+    def _energy_mode(self) -> str | None:
+        return self.vera_device.get_energy_mode()
+
+    @property
+    def _is_eco(self) -> bool:
+        """Return True while the thermostat runs on its energy savings setback.
+
+        The setback setpoint is not reported by the Vera, so no target
+        temperature is exposed in this mode.
+        """
+        return self._energy_mode == ENERGY_MODE_SAVINGS
+
+    @property
     def _has_heat_cool_range(self) -> bool:
         """Return True when the thermostat reports both heat and cool setpoints."""
         return self._heat_setpoint is not None and self._cool_setpoint is not None
@@ -89,6 +108,10 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
             | ClimateEntityFeature.TURN_OFF
             | ClimateEntityFeature.TURN_ON
         )
+        if self._energy_mode is not None:
+            features |= ClimateEntityFeature.PRESET_MODE
+        if self._is_eco:
+            return features
         if self.hvac_mode == HVACMode.HEAT_COOL and self._has_heat_cool_range:
             return features | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
         return features | ClimateEntityFeature.TARGET_TEMPERATURE
@@ -100,7 +123,9 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
 
         Need to be one of HVAC_MODE_*.
         """
-        mode = self.vera_device.get_hvac_mode()
+        mode = self.vera_device.get_hvac_mode() or ""
+        # In energy savings mode the Vera reports e.g. "EconomyHeatOn".
+        mode = mode.removeprefix("Economy")
         if mode == "HeatOn":
             return HVACMode.HEAT
         if mode == "CoolOn":
@@ -108,6 +133,22 @@ class VeraThermostat(VeraEntity[veraApi.VeraThermostat], ClimateEntity):
         if mode == "AutoChangeOver":
             return HVACMode.HEAT_COOL
         return HVACMode.OFF
+
+    @property
+    @override
+    def preset_mode(self) -> str | None:
+        """Return eco while the thermostat is in energy savings mode."""
+        return PRESET_ECO if self._is_eco else PRESET_NONE
+
+    @override
+    def set_preset_mode(self, preset_mode: str) -> None:
+        """Set the energy mode."""
+        if preset_mode == PRESET_ECO:
+            self.vera_device.set_energy_mode(ENERGY_MODE_SAVINGS)
+        else:
+            self.vera_device.set_energy_mode(ENERGY_MODE_NORMAL)
+
+        self.schedule_update_ha_state()
 
     @property
     @override
